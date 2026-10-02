@@ -290,7 +290,7 @@ jobs:
           cp -v openwrt/.config artifacts/config.used 2>/dev/null || true
 
           # ---- 刷机安全校验：产物必须塞得进设备的分区 ----
-          # 这台机器的分区（实测）：0:HLOS = 12MB，rootfs = 2GB
+          # 目标机型的分区（依据上游 device 定义与公开分区表）：0:HLOS = 12MB，rootfs = 2GB
           TAR="$(ls "$OUT"/*sysupgrade.bin 2>/dev/null | head -1)"
           if [ -n "$TAR" ]; then
             echo "=== sysupgrade 包内容 ==="
@@ -367,8 +367,8 @@ jobs:
 
             见 `sha256sums` / `SHA256SUMS.local`。
 
-            刷机前请读 `docs/04-刷机与回滚.md`，并确认已备份
-            `device-backup/`（ART 校准 + uboot 双槽）。
+            刷机前的注意事项与救砖流程见本地文档 `docs/04-刷机与回滚.md`
+            （文档只保留在本地，不在本仓库内）。
           files: artifacts/*
           draft: false
           prerelease: false
