@@ -1,0 +1,102 @@
+# ============================================================================
+# 关键：这个仓库是用来"编译固件"的，绝不能把密码、证书、密钥、备份提交进来
+# 你选择的方案是"固件不内置任何配置"，所以本仓库里也不需要任何真实凭据。
+# ============================================================================
+
+# ---- 凭据与密钥（任何情况下都不要入库）----
+secrets/
+*.key
+*.pem
+*.crt
+*.csr
+*.p12
+*.pfx
+*.asc
+*.gpg
+!references/**/*.asc
+id_rsa*
+id_ed25519*
+known_hosts
+auth.json
+.env
+.env.*
+*.token
+token.txt
+
+# ---- 设备备份与固件镜像（不要往 git 里塞几十上百 MB）----
+*.tar.gz
+*.tar
+*.rar
+*.7z
+*.zip
+*.bin
+*.itb
+# 例外：可选的无线校准数据修复件要入库（65KB，见 optional/wifi-bdf/README.md）
+# 它是 OpenWrt 官方分发的通用 BDF，不含你设备的私有数据，可以公开
+!optional/wifi-bdf/*.bin
+
+# 设备专属备份**不入库**（公开仓库会泄露设备 MAC 与射频校准数据）
+# 文件仍在本地 device-backup/ 目录里，只是不进 git。见 device-backup/README.md
+# 如果你把仓库设为私有、希望把这些备份也纳入版本管理，删掉下面这行即可
+device-backup/*.bin
+device-backup/*.tar.gz
+*.img
+!configs/**/*.config
+backup-*
+!scripts/**
+iStoreOS-*
+istoreos-*
+openwrt-*.bin
+
+# ---- 本地编译产物（如果你想在本机也编译）----
+openwrt/
+libwrt/
+bin/
+build_dir/
+staging_dir/
+tmp/
+dl/
+logs/
+artifacts/
+ccache/
+*.manifest
+sha256sums
+.config
+.config.old
+.config.orig
+
+# ---- 上游原始备份配置里可能夹带的敏感内容 ----
+uci-*.tar.gz
+etc/shadow
+etc/passwd
+etc/config/luci
+etc/config/ddns
+etc/config/lucky
+etc/config/zerotier
+etc/config/samba
+etc/config/shadowsocksr
+etc/config/openclash
+etc/config/openvpn
+etc/config/linkease
+etc/config/ddnsto
+etc/config/serverchan
+etc/dropbear/
+etc/openvpn/
+etc/uhttpd.key
+etc/uhttpd.crt
+ini/
+
+# ---- 编辑器/系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---- 本地文档与参考资料：留在本机，不进仓库 ----
+# 理由：这些内容包含设备实测细节（分区表、uboot 版本、网段、内存占用）等，
+# 属于"本机资料"而非"编译所需"，没必要放到 GitHub 上。
+docs/
+references/
+device-backup/

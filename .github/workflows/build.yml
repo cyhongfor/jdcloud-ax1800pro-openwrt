@@ -1,0 +1,375 @@
+name: Build OpenWrt for JDCloud RE-SS-01
+
+# 京东云 AX1800 Pro（jdcloud_re-ss-01 / IPQ6000）自编译
+# 上游：LiBwrt/LibWrt 分支 25.12-nss（内核 6.12 + 满血 NSS）
+#
+# 触发方式：
+#   1) Actions 页面手动 Run workflow（可临时改上游仓库/分支、是否发 Release）
+#   2) push 到 main 分支且只改了 configs/ scripts/ 或本工作流
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '上游源码仓库地址'
+        required: false
+        default: 'https://github.com/LiBwrt/LibWrt.git'
+      source_branch:
+        description: '上游分支'
+        required: false
+        default: '25.12-nss'
+      source_commit:
+        description: '【稳定期建议填】锁定到确切的 commit SHA；留空=跟随分支最新'
+        required: false
+        default: ''
+      publish_release:
+        description: '编译成功后创建 GitHub Release'
+        type: boolean
+        required: false
+        default: true
+      publish_packages:
+        description: '把整套 .apk 软件包打包成 Release 附件（体积大，按需开启）'
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main, master]
+    paths:
+      - 'configs/**'
+      - 'scripts/**'
+      - '.github/workflows/build.yml'
+
+# 同一分支同时只跑一个编译，避免互相抢资源
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SRC_REPO: ${{ inputs.source_repo || 'https://github.com/LiBwrt/LibWrt.git' }}
+  SRC_BRANCH: ${{ inputs.source_branch || '25.12-nss' }}
+  DEVICE: jdcloud_re-ss-01
+  TARGET: qualcommax/ipq60xx
+
+jobs:
+  build:
+    name: 编译 ${{ github.event.inputs.source_branch || '25.12-nss' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      # ---------------------------------------------------------------- 准备
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          set -x
+          # OpenWrt 全量编译需要 20–25GB。GitHub 的 runner 镜像里预装了一堆用不到的大件，
+          # 先清掉，避免编到一半 "No space left on device"（那是最浪费时间的失败方式）。
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/lib/node_modules /opt/az /usr/lib/mono \
+                      /usr/share/swift /opt/google /usr/local/.ghcup \
+                      /usr/local/share/powershell /usr/share/miniconda \
+                      /usr/local/lib/ruby/gems /opt/conda || true
+          sudo apt-get clean
+          sudo swapoff -a || true
+          echo "=== 清理后的可用空间 ==="
+          df -h /
+          FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "可用 ${FREE_GB}GB"
+          if [ "${FREE_GB:-0}" -lt 25 ]; then
+            echo "::warning::可用空间只有 ${FREE_GB}GB，编译可能中途因空间不足失败"
+          fi
+
+      - name: 克隆上游源码
+        run: |
+          git clone --depth 1 -b "${SRC_BRANCH}" --single-branch "${SRC_REPO}" openwrt
+          cd openwrt
+          # 若指定了 source_commit，则锁定到该确切的提交，保证构建可复现
+          if [ -n "${{ inputs.source_commit }}" ]; then
+            echo "按输入锁定到 commit: ${{ inputs.source_commit }}"
+            git fetch --depth 1 origin "${{ inputs.source_commit }}"
+            git checkout --detach FETCH_HEAD
+          fi
+          echo "上游 commit: $(git rev-parse HEAD)"
+          echo "### 本次构建基于上游 commit \`$(git rev-parse HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+          test -f "target/linux/qualcommax/image/ipq60xx.mk"
+          grep -q "jdcloud_re-ss-01" target/linux/qualcommax/image/ipq60xx.mk \
+            || { echo "::error::上游分支 ${SRC_BRANCH} 不含 ${DEVICE} 设备定义，已中止"; exit 1; }
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext \
+            gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses5-dev libncursesw5-dev libreadline-dev libfuse-dev libssl-dev libtool \
+            lrzsz genisoimage msmtp nano ninja-build p7zip p7zip-full patch pkgconf \
+            python3 python3-pip libpython3-dev qemu-utils rsync scons squashfs-tools \
+            subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          df -h /
+
+      # Kconfig 的规范是"注释只能整行"，真实构建配置里行内注释为 0 行。
+      # 这里把这种写法拦下来，避免把有风险的 .config 交给 make defconfig。
+      # 注意：这一步只读仓库里的 configs/*.config，不涉及 openwrt/.config
+      - name: 配置卫生检查（禁止行内注释）
+        run: |
+          fail=0
+          for f in configs/*.config; do
+            bad=$(grep -nE '^CONFIG_[A-Za-z0-9_-]+=.*#' "$f" || true)
+            if [ -n "$bad" ]; then
+              echo "::error file=$f::发现行内注释，请把注释单独放一行"
+              echo "$bad"
+              fail=1
+            fi
+          done
+          if [ "$fail" = "1" ]; then
+            echo "配置格式不合规，已中止（Kconfig 规范：注释必须单独占一行）"
+            exit 1
+          fi
+          echo "✅ 配置格式检查通过（无行内注释）"
+          echo "--- 请求的包数量: $(grep -cE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y' configs/packages.config)"
+
+      # ★ 顺序很重要：必须先 diy-1 加 feed、再 feeds update/install、最后才写 .config
+      #
+      # 原因（实测踩过的坑）：scripts/feeds 里有个 refresh_config()，
+      #   只要 .config 存在，feeds update/install 就会静默执行 `make oldconfig`
+      #   （输出重定向到 /dev/null，日志里什么都看不到）。
+      #   如果此时 feed 里的包还没安装，Kconfig 不认识那些符号，
+      #   我们写的 CONFIG_PACKAGE_* 会被**整批丢弃**，最后编出一个几乎没有插件的固件。
+      # 所以：.config 必须在 feeds 安装完成之后才落到源码树里。
+      - name: 添加第三方 feed（diy-1）
+        run: |
+          cd openwrt
+          # diy-1 读的是"请求清单"configs/packages.config，不是 .config（此时 .config 还不存在）
+          bash ../scripts/diy-1-feeds.sh ../configs/packages.config
+          echo "--- feeds.conf.default ---"
+          cat feeds.conf.default
+
+      - name: 更新并安装 feeds
+        run: |
+          cd openwrt
+          # 此时 .config 还不存在，refresh_config() 会直接 return，不会动我们的配置
+          test ! -e .config || echo "::warning::.config 意外存在，feeds 可能会重建它"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "--- feeds 安装后 .config 是否存在（应为不存在）---"
+          ls -l .config 2>/dev/null || echo "  不存在 ✓"
+
+      - name: 写入设备配置（必须在 feeds 之后）
+        run: |
+          cp configs/jdcloud_re-ss-01.config openwrt/.config
+          if [ -s configs/packages.config ]; then
+            cat configs/packages.config >> openwrt/.config
+          fi
+          echo "--- .config 行数: $(wc -l < openwrt/.config)"
+
+      - name: 编译前自定义（diy-2）
+        run: |
+          cd openwrt
+          bash ../scripts/diy-2-custom.sh
+
+      - name: 可选：注入本仓库 files/ 覆盖层
+        run: |
+          if [ -d files ] && [ -n "$(ls -A files 2>/dev/null)" ]; then
+            echo "检测到 files/ 覆盖层，注入源码树"
+            cp -a files/. openwrt/files/
+          else
+            echo "无 files/ 覆盖层（按你的选择：不内置任何配置）"
+          fi
+
+      - name: 展开配置（make defconfig）
+        run: |
+          cd openwrt
+          make defconfig
+          echo "=== 最终设备配置 ==="
+          grep -E '^CONFIG_TARGET_(qualcommax|BOARD|SUBTARGET|PROFILE|ARCH_PACKAGES)' .config || true
+          echo "=== NSS / WiFi 关键项（必须非 0，否则说明配置又被丢了）==="
+          grep -E 'NSS_FIRMWARE_VERSION|ATH11K_MEM_PROFILE|ATH11K_NSS' .config || true
+          if ! grep -qE '^CONFIG_NSS_FIRMWARE_VERSION_[0-9_]+=y' .config; then
+            echo "::error::NSS 固件版本项丢失 —— .config 又被 oldconfig 重建了，不要继续编译"
+            exit 1
+          fi
+          echo "=== 已选中的 luci-app 数量 ==="
+          grep -c '^CONFIG_PACKAGE_luci-app-.*=y' .config || true
+
+      # defconfig 会静默丢弃不存在的包名，这里把它揪出来并**中止构建**，
+      # 避免"编了三小时、刷上去发现插件全没了"。
+      - name: 校验包选择是否真的生效（STRICT）
+        run: |
+          cd openwrt
+          STRICT=1 bash ../scripts/check-packages.sh ../configs/packages.config
+
+      # ---------------------------------------------------------------- 缓存
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.DEVICE }}-${{ env.SRC_BRANCH }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.DEVICE }}-${{ env.SRC_BRANCH }}-
+            ccache-${{ env.DEVICE }}-
+
+      - name: 缓存下载的源码包 (dl)
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ env.DEVICE }}-${{ hashFiles('configs/*.config') }}
+          restore-keys: |
+            dl-${{ env.DEVICE }}-
+
+      # ---------------------------------------------------------------- 编译
+      - name: 预下载依赖包
+        run: |
+          cd openwrt
+          make download -j8 || make download -j1 V=s
+          echo "dl 目录大小: $(du -sh dl | cut -f1)"
+
+      - name: 编译固件
+        id: build
+        run: |
+          cd openwrt
+          make -j$(nproc) || {
+            echo "::warning::并行编译失败，改用单线程 V=s 重试以获取详细日志"
+            make -j1 V=s
+          }
+
+      # 失败时把关键日志单独上传：OpenWrt 的报错往往埋在几千行输出里，
+      # 单独抽出「哪个包失败 + 最后几十行」能让下次修复有的放矢，不必重跑一遍才知道原因。
+      - name: 失败时收集诊断日志
+        if: failure()
+        run: |
+          {
+            echo "## 编译失败诊断"
+            echo
+            echo "### 各包编译日志里的错误（最后 80 行）"
+            echo '```'
+            for f in $(grep -rl -iE '\berror\b|Error [0-9]' openwrt/logs 2>/dev/null | head -8); do
+              echo "----- $f -----"
+              tail -80 "$f"
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+          # 把日志目录打包（可能含多个包的完整日志）
+          if [ -d openwrt/logs ]; then
+            tar -czf logs-diagnostic.tar.gz openwrt/logs 2>/dev/null || true
+            ls -lh logs-diagnostic.tar.gz || true
+          fi
+
+      - name: 上传失败诊断日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ env.DEVICE }}-${{ github.run_number }}
+          path: logs-diagnostic.tar.gz
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ---------------------------------------------------------------- 产物
+      - name: 检查并收集产物
+        if: always()
+        run: |
+          set -e
+          OUT="openwrt/bin/targets/${TARGET}"
+          echo "=== 产物目录 ==="
+          ls -lh "$OUT" || { echo "::error::产物目录不存在，编译可能失败"; exit 1; }
+          ls -1 "$OUT"/*.bin "$OUT"/*.itb 2>/dev/null || true
+          if ! ls "$OUT"/*sysupgrade.bin >/dev/null 2>&1; then
+            echo "::error::没有找到 sysupgrade.bin，编译失败"
+            exit 1
+          fi
+          mkdir -p artifacts
+          cp -v "$OUT"/*.bin "$OUT"/*.itb "$OUT"/sha256sums "$OUT"/*.manifest \
+                "$OUT"/config.buildinfo artifacts/ 2>/dev/null || true
+          cp -v openwrt/.config artifacts/config.used 2>/dev/null || true
+
+          # ---- 刷机安全校验：产物必须塞得进设备的分区 ----
+          # 这台机器的分区（实测）：0:HLOS = 12MB，rootfs = 2GB
+          TAR="$(ls "$OUT"/*sysupgrade.bin 2>/dev/null | head -1)"
+          if [ -n "$TAR" ]; then
+            echo "=== sysupgrade 包内容 ==="
+            tar tvf "$TAR" 2>/dev/null | awk '{printf "  %10d  %s\n", $3, $6}' | head -10
+            KSZ="$(tar tvf "$TAR" 2>/dev/null | awk '/kernel$/{print $3; exit}')"
+            RSZ="$(tar tvf "$TAR" 2>/dev/null | awk '/root$/{print $3; exit}')"
+            if [ -n "$KSZ" ] && [ "$KSZ" -gt 12582912 ]; then
+              echo "::error::内核 ${KSZ} 字节超过 0:HLOS 分区(12MB)，刷入会失败"
+              exit 1
+            fi
+            if [ -n "$RSZ" ] && [ "$RSZ" -gt 2147483648 ]; then
+              echo "::error::rootfs ${RSZ} 字节超过 rootfs 分区(2GB)"
+              exit 1
+            fi
+            echo "✅ 分区尺寸校验通过（kernel=${KSZ:-未知} / root=${RSZ:-未知} 字节）"
+          fi
+
+          # 可选：把整套 .apk 软件包打包，方便以后在设备上按需安装（不必重编固件）
+          if [ "${{ inputs.publish_packages }}" = "true" ] && [ -d "$OUT/packages" ]; then
+            echo "=== 打包软件包仓库 ==="
+            ls "$OUT/packages" | head -5
+            echo "包数量: $(ls "$OUT/packages"/*.apk 2>/dev/null | wc -l)"
+            tar -C "$OUT" -czf "artifacts/packages-$(echo ${TARGET} | tr '/' '-').tar.gz" packages
+          else
+            echo "（未开启 publish_packages，跳过软件包打包）"
+          fi
+
+          echo "=== 校验和 ==="
+          cd artifacts && sha256sum *.bin 2>/dev/null | tee SHA256SUMS.local
+
+      - name: 上传构建产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-${{ env.DEVICE }}-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 发布 Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.DEVICE }}-${{ github.run_number }}
+          name: 'OpenWrt for JDCloud AX1800 Pro (${{ env.DEVICE }}) #${{ github.run_number }}'
+          body: |
+            ## 京东云 AX1800 Pro (RE-SS-01) 自编译固件
+
+            - 上游源码：`${{ env.SRC_REPO }}`
+            - 上游分支：`${{ env.SRC_BRANCH }}`
+            - 上游 commit：见本次 Actions 运行摘要（**稳定期请把这个 SHA 填进 `source_commit`**）
+            - 目标：`${{ env.TARGET }}` / 设备 `${{ env.DEVICE }}`
+            - 内核：6.12（NSS 满血，含 WiFi NSS 卸载）
+            - 构建：GitHub Actions run #${{ github.run_number }}
+            - 配置：**不内置任何网络/密码配置**，刷入后默认 `192.168.1.1`、无 root 密码
+
+            ### 首次从 iStoreOS 刷入（必须不保留配置）
+
+            无线驱动从 QCA 闭源换成 ath11k，保留旧配置会导致无线异常：
+
+            ```sh
+            scp openwrt-*-squashfs-sysupgrade.bin root@192.168.1.1:/tmp/
+            sysupgrade -n /tmp/openwrt-*-squashfs-sysupgrade.bin
+            ```
+
+            ### 以后升级本固件（保留配置）
+
+            ```sh
+            sysupgrade -b /tmp/config-$(date +%F).tar.gz   # 先导出配置做保险
+            sysupgrade /tmp/openwrt-*-squashfs-sysupgrade.bin   # 注意：不带 -n
+            ```
+
+            ### 校验
+
+            见 `sha256sums` / `SHA256SUMS.local`。
+
+            刷机前请读 `docs/04-刷机与回滚.md`，并确认已备份
+            `device-backup/`（ART 校准 + uboot 双槽）。
+          files: artifacts/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
