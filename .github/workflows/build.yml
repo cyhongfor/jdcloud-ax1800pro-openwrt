@@ -370,7 +370,9 @@ jobs:
           retention-days: 30
 
       - name: 发布 Release
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        # push 触发的运行也要发布 Release（否则产物只在 artifact 里，需要登录才能下载）。
+        # 手动触发时则由 publish_release 开关决定。
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.DEVICE }}-${{ github.run_number }}
