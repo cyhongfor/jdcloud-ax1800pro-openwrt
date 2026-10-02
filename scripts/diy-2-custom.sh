@@ -13,6 +13,46 @@ set -euo pipefail
 
 echo "=== 构建期自定义检查 ==="
 
+# ---------------------------------------------------------------- 0. 上游 bug 临时修补
+# 问题：libffi 3.4.7（immortalwrt/packages openwrt-25.12）
+#   libffi 自己用 AC_CONFIG_HEADERS([fficonfig.h])，把 fficonfig.h 生成在
+#   **构建根目录**，即 $(PKG_BUILD_DIR)/fficonfig.h
+#   （依据：Makefile.in 里 CONFIG_HEADER = fficonfig.h、all: fficonfig.h，
+#     configure.ac 里 AC_CONFIG_HEADERS([fficonfig.h])）
+#
+#   但该包的 Makefile 仍按旧版本从
+#       $(PKG_BUILD_DIR)/$(GNU_TARGET_NAME)*/fficonfig.h
+#   复制 —— 3.4.7 下这个带 triplet 名字的目录根本不存在，
+#   于是 InstallDev 阶段 cp 失败，整个 world 构建在最后一刻中断。
+#   （实测：4 小时编译跑到最后一个包倒在 .14 秒的 InstallDev 上）
+#
+# 修补：改为"优先构建根目录、再回退旧路径"，都找不到时跳过并告警（不让全局构建挂掉）。
+#   上游修好后本段会自动跳过（找不到旧片段就什么也不做）。
+if [ -f feeds/packages/libs/libffi/Makefile ]; then
+  python3 - <<'PYEOF' || echo "  [警告] libffi 补丁执行出错（继续，稍后编译会暴露问题）"
+p = 'feeds/packages/libs/libffi/Makefile'
+s = open(p, encoding='utf-8').read()
+old = ("\t$(CP) \\\n"
+       "\t\t$(PKG_BUILD_DIR)/$(GNU_TARGET_NAME)*/fficonfig.h \\\n"
+       "\t\t$(1)/usr/include/\n")
+new = ("\t@if [ -f $(PKG_BUILD_DIR)/fficonfig.h ]; then \\\n"
+       "\t\t$(INSTALL_DATA) $(PKG_BUILD_DIR)/fficonfig.h $(1)/usr/include/; \\\n"
+       "\telif ls $(PKG_BUILD_DIR)/$(GNU_TARGET_NAME)*/fficonfig.h >/dev/null 2>&1; then \\\n"
+       "\t\t$(INSTALL_DATA) $(PKG_BUILD_DIR)/$(GNU_TARGET_NAME)*/fficonfig.h $(1)/usr/include/; \\\n"
+       "\telse \\\n"
+       "\t\techo \"WARNING: libffi fficonfig.h not found, skipping\"; \\\n"
+       "\tfi\n")
+if old in s:
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write(s.replace(old, new, 1))
+    print("  [补丁] libffi InstallDev: fficonfig.h 改为优先构建根目录（3.4.7 兼容）")
+else:
+    print("  [跳过] libffi Makefile 没有预期的旧片段（上游可能已修）")
+PYEOF
+else
+  echo "  [跳过] 未安装 libffi 包（本次构建不需要它）"
+fi
+
 # ---------------------------------------------------------------- 1. 冲突保护
 # turboacc 的 SFE/flow-offload 与 NSS 硬件卸载功能重复，同时启用会互相打架
 if grep -qE '^CONFIG_PACKAGE_luci-app-turboacc=y' .config; then

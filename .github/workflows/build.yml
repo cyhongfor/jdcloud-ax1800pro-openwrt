@@ -32,6 +32,11 @@ on:
         type: boolean
         required: false
         default: false
+      serial_retry:
+        description: '并行编译失败后改用单线程 V=s 重试（仅怀疑并发竞争时勾选，会多花约 1 小时）'
+        type: boolean
+        required: false
+        default: false
   push:
     branches: [main, master]
     paths:
@@ -211,7 +216,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ env.DEVICE }}-${{ env.SRC_BRANCH }}-${{ github.run_id }}
+          key: ccache-${{ env.DEVICE }}-${{ env.SRC_BRANCH }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ccache-${{ env.DEVICE }}-${{ env.SRC_BRANCH }}-
             ccache-${{ env.DEVICE }}-
@@ -220,7 +225,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: openwrt/dl
-          key: dl-${{ env.DEVICE }}-${{ hashFiles('configs/*.config') }}
+          key: dl-${{ env.DEVICE }}-${{ hashFiles('configs/*.config') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             dl-${{ env.DEVICE }}-
 
@@ -231,14 +236,48 @@ jobs:
           make download -j8 || make download -j1 V=s
           echo "dl 目录大小: $(du -sh dl | cut -f1)"
 
+      # 注意：默认不做单线程重试。
+      # 实测教训：一次确定性失败（libffi）触发串行重试后，白白多跑了 48 分钟才再次失败。
+      # 只有当怀疑是并发竞争导致失败时，才手动重跑并勾选 serial_retry。
       - name: 编译固件
         id: build
         run: |
           cd openwrt
-          make -j$(nproc) || {
-            echo "::warning::并行编译失败，改用单线程 V=s 重试以获取详细日志"
+          if make -j$(nproc); then
+            echo "✅ 并行编译成功"
+            exit 0
+          fi
+          echo "::error::并行编译失败。若怀疑是并发竞争，可重跑并勾选 serial_retry（单线程 V=s，慢但日志详细）"
+          if [ "${{ inputs.serial_retry }}" = "true" ]; then
+            echo "按输入启用单线程重试…"
             make -j1 V=s
-          }
+          else
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------- 缓存保存（失败也保存）
+      # 关键：actions/cache 默认只在作业成功时保存。这次实测就吃了亏 ——
+      # 4 小时下载+编译全部作废，重跑要从零开始。
+      # 下面两个步骤用 if: always() 强制保存，让失败后的重试能复用 dl/ 与 ccache。
+      - name: 保存 ccache（即使编译失败）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.DEVICE }}-${{ env.SRC_BRANCH }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 保存源码包缓存 dl（即使编译失败）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ env.DEVICE }}-${{ hashFiles('configs/*.config') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 缓存占用情况
+        if: always()
+        run: |
+          du -sh ~/.ccache 2>/dev/null || true
+          du -sh openwrt/dl 2>/dev/null || true
 
       # 失败时把关键日志单独上传：OpenWrt 的报错往往埋在几千行输出里，
       # 单独抽出「哪个包失败 + 最后几十行」能让下次修复有的放矢，不必重跑一遍才知道原因。
